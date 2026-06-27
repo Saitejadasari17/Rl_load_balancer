@@ -24,7 +24,6 @@ except ImportError:
     from src.agent import train_rl_agent, evaluate_rl_agent
 app = FastAPI(title="Adaptive Load Balancing - RL System", version="1.0.0")
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,7 +40,7 @@ training_state = {
 }
 
 class TrainingConfig(BaseModel):
-    timesteps: int = 100
+    timesteps: int = 2000  
     episodes: int = 20
     servers: int = 3
 
@@ -88,12 +87,12 @@ async def start_training(config: TrainingConfig):
         training_state["progress"] = 0
         training_state["message"] = "Initializing..."
         
-        # Create environment
+
         env = LoadBalancerEnv(n_servers=config.servers)
         training_state["progress"] = 10
         training_state["message"] = "Environment created"
         
-        # Evaluate baselines
+     
         training_state["progress"] = 25
         training_state["message"] = "Evaluating baselines..."
         
@@ -106,7 +105,7 @@ async def start_training(config: TrainingConfig):
         
         baseline_results = {}
         for name, agent in baselines.items():
-            result = evaluate_agent(env, agent, n_episodes=2, max_steps=500)
+            result = evaluate_agent(env, agent, n_episodes=5, max_steps=500)
             baseline_results[name] = {
                 'avg_latency': float(result['avg_latency']),
                 'avg_utilization': float(result['avg_utilization']),

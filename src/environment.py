@@ -60,7 +60,14 @@ class LoadBalancerEnv(gym.Env):
         return np.array(state, dtype=np.float32)
 
     def step(self, action):
-        """Execute one step in the environment."""
+        """
+        Execute one step in the environment.
+        
+        Reward: Negative latency (reward = -latency)
+        - Lower latency → higher reward (less negative)
+        - Higher queue naturally increases latency → lowers reward
+        - Agent implicitly learns Least Connections via latency minimization
+        """
         if not (0 <= action < self.n_servers):
             raise ValueError(f"Invalid action {action}. Must be 0-{self.n_servers-1}")
 
@@ -93,8 +100,10 @@ class LoadBalancerEnv(gym.Env):
                 s['cpu'] = max(s['cpu'] - 0.02, 0.0)  # Gradual CPU decrease
                 s['queue'] = max(s['queue'] - np.random.randint(0, 2), 0)  # Process some requests
 
-        # Reward: negative latency (lower latency = higher reward)
-        reward = -latency
+        # Reward: latency-based (negative latency = positive reward)
+        # Lower latency = less negative reward = higher Q-value
+        # Naturally encodes queue effects (high queue → high latency → high negative reward)
+        reward = -min(latency / 300.0, 1.0)
 
         self.current_step += 1
         self.total_requests += 1
@@ -103,7 +112,7 @@ class LoadBalancerEnv(gym.Env):
         terminated = self.current_step >= self.max_steps
         truncated = False
 
-        return self._get_state(), reward, terminated, truncated, {}
+        return self._get_state(), reward, terminated, truncated, {"latency": latency}
 
     def render(self, mode='human'):
         """Render the current state."""
