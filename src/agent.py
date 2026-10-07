@@ -465,6 +465,7 @@ def train_rl_agent(env, n_episodes=20, max_steps=200, model_path="models/dqn_age
     episode_latencies = []
     best_latency = float('inf')
     episodes_without_improvement = 0
+    ever_saved = False
 
     print(f"Training on device: {agent.device}")
     print(f"Starting DQN training for {n_episodes} episodes...")
@@ -531,29 +532,35 @@ def train_rl_agent(env, n_episodes=20, max_steps=200, model_path="models/dqn_age
         if (episode + 1) % 10 == 0:
             eval_results = evaluate_rl_agent(env, agent, n_episodes=3, max_steps=max_steps)
             eval_latency = eval_results['avg_latency']
-            
+
             print(f"  --> Evaluation Latency: {eval_latency:.2f} ms")
-            
-            # Improvement of more than 0.5 ms?
+
+            # Save if improved by more than 0.5 ms
             if eval_latency < best_latency - 0.5:
                 best_latency = eval_latency
                 episodes_without_improvement = 0
+                ever_saved = True
                 agent.save(model_path)
                 print(f"  --> New best model saved (Latency: {best_latency:.2f} ms)")
-            else:
-                episodes_without_improvement += 10  # we evaluate every 10 episodes
-                
-            if episodes_without_improvement >= patience:
+            elif ever_saved:
+                # Only count stagnation after we've saved at least one checkpoint
+                episodes_without_improvement += 10
+
+            if ever_saved and episodes_without_improvement >= patience:
                 print(f"\nEarly stopping at episode {episode + 1} "
                       f"(no improvement for {patience} episodes)")
-                # Reload the best checkpoint found as per paper
-                agent.load(model_path)
+                # Reload the best checkpoint found
+                try:
+                    agent.load(model_path)
+                except Exception:
+                    pass
                 break
 
     if agent.writer is not None:
         agent.writer.close()
 
-    print(f"\nBest model saved to {model_path}.pt (reward={best_reward:.1f})")
+    best_label = f"{best_latency:.2f} ms" if best_latency < float('inf') else "N/A"
+    print(f"\nBest model saved to {model_path}.pt (latency={best_label})")
     print(f"Final epsilon: {agent.epsilon:.4f}")
 
     return agent, episode_rewards, episode_latencies

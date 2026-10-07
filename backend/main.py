@@ -123,21 +123,27 @@ async def start_training(config: TrainingConfig):
         os.makedirs('models', exist_ok=True)
         model, training_rewards, episode_latencies = train_rl_agent(
             env=env,
-            n_episodes=config.timesteps,  # Fixed: was total_timesteps (wrong parameter name)
+            n_episodes=config.episodes,
             max_steps=200,
             model_path='models/rl_agent_demo'
         )
-        
+
         # Evaluate RL
         training_state["progress"] = 85
         training_state["message"] = "Evaluating RL agent..."
-        
-        rl_results = evaluate_rl_agent(env, model, n_episodes=config.episodes, max_steps=500)
+
+        rl_results = evaluate_rl_agent(env, model, n_episodes=5, max_steps=200)
         rl_latency = rl_results['avg_latency']
-        
+
         # Calculate improvement
-        improvement = ((best_baseline - rl_latency) / best_baseline) * 100
-        
+        improvement = ((best_baseline - rl_latency) / best_baseline) * 100 if best_baseline > 0 else 0.0
+
+        # Build learning curve (one point every episode)
+        learning_curve = [
+            {"episode": i + 1, "latency": float(lat), "reward": float(training_rewards[i])}
+            for i, lat in enumerate(episode_latencies)
+        ]
+
         # Prepare results
         results = {
             "status": "completed",
@@ -149,18 +155,20 @@ async def start_training(config: TrainingConfig):
             },
             "best_baseline_ms": float(best_baseline),
             "rl_agent_ms": float(rl_latency),
-            "improvement": float(improvement)
+            "improvement": float(improvement),
+            "learning_curve": learning_curve,
+            "per_server_utilization": rl_results.get('per_server_utilization', [])
         }
-        
+
         # Save results
         os.makedirs('results', exist_ok=True)
         with open('results/api_training_results.json', 'w') as f:
             json.dump(results, f, indent=2)
-        
+
         training_state["status"] = "completed"
         training_state["progress"] = 100
         training_state["message"] = "Training complete!"
-        
+
         return results
     
     except Exception as e:
