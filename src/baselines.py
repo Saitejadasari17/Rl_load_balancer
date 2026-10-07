@@ -30,8 +30,9 @@ class RoundRobinAgent(BaselineAgent):
 class LeastConnectionsAgent(BaselineAgent):
     """Least Connections: Route to server with fewest queued requests."""
     def act(self, state):
-        # State format: [cpu1, queue1, lat1, cpu2, queue2, lat2, ...]
-        queues = [state[i*3 + 1] for i in range(self.n_servers)]  # Extract queue values
+        # State format per server: [cpu, queue, latency]
+        features_per_server = 3
+        queues = [state[i*features_per_server + 1] for i in range(self.n_servers)]  # Extract queue values
         return np.argmin(queues)  # Choose server with smallest queue
 
 class RandomAgent(BaselineAgent):
@@ -78,7 +79,8 @@ def evaluate_agent(env, agent, n_episodes=10, max_steps=200):
             episode_latencies.append(latency)
 
             # Track server utilizations
-            server_cpus = [next_obs[i*3] for i in range(env.n_servers)]
+            features_per_server = getattr(env, 'FEATURES_PER_SERVER', 3)
+            server_cpus = [next_obs[i*features_per_server] for i in range(env.n_servers)]
             episode_utilizations.append(np.mean(server_cpus))
 
             obs = next_obs
