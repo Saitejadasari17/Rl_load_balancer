@@ -1,8 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import os
 import sys
+import traceback
 import numpy as np
 import pandas as pd
 import json
@@ -184,11 +186,13 @@ async def get_metrics():
         "max_servers": 10,
         "max_episodes": 100,
         "max_timesteps": 500000,
-        "algorithms": ["Round Robin", "Least Connections", "Random", "Weighted RR", "PPO"],
+        "algorithms": ["Round Robin", "Least Connections", "Random", "Weighted RR", "DQN"],
         "rl_config": {
-            "algorithm": "PPO",
-            "learning_rate": 3e-4,
-            "n_steps": 2048
+            "algorithm": "Double DQN + Dueling + Prioritized Experience Replay",
+            "learning_rate": 0.001,
+            "gamma": 0.99,
+            "batch_size": 48,
+            "target_update_freq": 10
         }
     }
 
@@ -204,4 +208,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-

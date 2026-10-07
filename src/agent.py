@@ -1,10 +1,37 @@
 """
-Deep Q-Network Agent for Adaptive Load Balancing
+Deep Q-Network Agent for Adaptive Load Balancing (PyTorch implementation)
+
+Implements the enhanced DQN framework described in the project's research
+problem statement (Section 11 - "Evolution of the Learning Algorithm"):
+
+  - PyTorch-based Deep Q-Networks for efficient neural network training
+  - Automatic GPU acceleration (CUDA), with Apple MPS and CPU fallback
+  - Double DQN to reduce Q-value overestimation (decoupled action
+    selection / evaluation)
+  - Dueling Network Architecture (state-value + advantage streams)
+  - Prioritized Experience Replay (PER)
+  - Soft (Polyak) target network updates for smoother convergence
+  - AdamW optimization with weight decay for improved generalization
+  - Huber (Smooth L1) loss for robustness against large TD errors
+  - Gradient clipping for optimization stability
+  - Learning-rate scheduling for improved convergence
+  - Mixed precision training for faster GPU execution
+  - Checkpointing and early stopping for training efficiency/recoverability
+  - TensorBoard logging of rewards, losses, and training progress
+  - Deterministic seeding for reproducibility
 """
 
 import os
-import numpy as np
 import json
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # tensorboard is optional at runtime
+    SummaryWriter = None
 
 try:
     from .environment import LoadBalancerEnv
@@ -13,154 +40,118 @@ except ImportError:
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
     from environment import LoadBalancerEnv
 
-class NeuralNetwork:
-    def __init__(self, input_size, hidden_size, output_size, lr=0.001):
-        self.lr = lr
-        self.W1 = np.random.randn(input_size, hidden_size) * np.sqrt(2.0 / input_size)
-        self.b1 = np.zeros((1, hidden_size))
-        self.W2 = np.random.randn(hidden_size, hidden_size) * np.sqrt(2.0 / hidden_size)
-        self.b2 = np.zeros((1, hidden_size))
-        self.W3 = np.random.randn(hidden_size, output_size) * np.sqrt(2.0 / hidden_size)
-        self.b3 = np.zeros((1, output_size))
+
+# ──────────────────────────────────────────────
+#  Device selection & reproducibility
+# ──────────────────────────────────────────────
+
+def get_device():
+    """Select CUDA > Apple MPS > CPU, in that order."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def seed_everything(seed=42):
+    """Seed all sources of randomness for reproducible training runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# ──────────────────────────────────────────────
+#  Dueling Q-Network
+# ──────────────────────────────────────────────
+
+class DuelingQNetwork(nn.Module):
+    """
+    Dueling architecture: a shared feature extractor feeding two heads —
+    a scalar state-value V(s) and a per-action advantage A(s, a).
+
+        Q(s, a) = V(s) + (A(s, a) - mean_a A(s, a))
+
+    Separating "how good is this state" from "how much better is this
+    action than the others" improves value estimation, especially when
+    many actions have similar value (as with near-identical servers).
+    """
+
+    def __init__(self, state_size, hidden_size, action_size):
+        super().__init__()
+        self.feature = nn.Sequential(
+            nn.Linear(state_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+        )
+        self.value_stream = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
+        )
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, action_size),
+        )
 
     def forward(self, x):
-        """Forward pass through the network."""
-        x = np.asarray(x, dtype=np.float32)
-        x = np.atleast_2d(x)
-
-        # Layer 1: Linear + ReLU
-        self.z1 = x @ self.W1 + self.b1
-        self.a1 = np.maximum(0, self.z1)  # ReLU
-
-        # Layer 2: Linear + ReLU
-        self.z2 = self.a1 @ self.W2 + self.b2
-        self.a2 = np.maximum(0, self.z2)  # ReLU
-
-        # Layer 3: Linear (Q-values, no activation)
-        self.z3 = self.a2 @ self.W3 + self.b3
-
-        # Cache input for backprop
-        self.input = x
-        return self.z3
-
-    def backward(self, x, target):
-        """
-        Backpropagation using mean squared error loss.
-        Computes gradients and updates weights.
-        """
-        x = np.asarray(x, dtype=np.float32)
-        x = np.atleast_2d(x)
-        target = np.asarray(target, dtype=np.float32)
-        target = np.atleast_2d(target)
-        batch_size = x.shape[0]
-
-        # Forward pass (recompute activations)
-        output = self.forward(x)
-
-        # Loss gradient: d(MSE)/d(output) = 2(output - target) / batch_size
-        d_output = 2.0 * (output - target) / batch_size
-
-        # Gradient for Layer 3
-        dW3 = self.a2.T @ d_output
-        db3 = np.sum(d_output, axis=0, keepdims=True)
-
-        # Backprop through Layer 3
-        d_a2 = d_output @ self.W3.T
-
-        # ReLU gradient for Layer 2
-        d_z2 = d_a2 * (self.z2 > 0).astype(float)
-
-        # Gradient for Layer 2
-        dW2 = self.a1.T @ d_z2
-        db2 = np.sum(d_z2, axis=0, keepdims=True)
-
-        # Backprop through Layer 2
-        d_a1 = d_z2 @ self.W2.T
-
-        # ReLU gradient for Layer 1
-        d_z1 = d_a1 * (self.z1 > 0).astype(float)
-
-        # Gradient for Layer 1
-        dW1 = self.input.T @ d_z1
-        db1 = np.sum(d_z1, axis=0, keepdims=True)
-
-        # Gradient clipping to prevent exploding gradients
-        for grad in [dW1, db1, dW2, db2, dW3, db3]:
-            np.clip(grad, -1.0, 1.0, out=grad)
-
-        # Update weights (gradient descent)
-        self.W1 -= self.lr * dW1
-        self.b1 -= self.lr * db1
-        self.W2 -= self.lr * dW2
-        self.b2 -= self.lr * db2
-        self.W3 -= self.lr * dW3
-        self.b3 -= self.lr * db3
-
-        # Return loss for monitoring
-        loss = np.mean((output - target) ** 2)
-        return loss
-
-    def copy_weights_from(self, other):
-        """Copy weights from another network (for target network updates)."""
-        self.W1 = other.W1.copy()
-        self.b1 = other.b1.copy()
-        self.W2 = other.W2.copy()
-        self.b2 = other.b2.copy()
-        self.W3 = other.W3.copy()
-        self.b3 = other.b3.copy()
-
-    def save(self, path):
-        """Save network weights to file."""
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-        np.savez(path,
-                 W1=self.W1, b1=self.b1,
-                 W2=self.W2, b2=self.b2,
-                 W3=self.W3, b3=self.b3)
-
-    def load(self, path):
-        """Load network weights from file."""
-        if not path.endswith('.npz'):
-            path += '.npz'
-        data = np.load(path)
-        self.W1 = data['W1']
-        self.b1 = data['b1']
-        self.W2 = data['W2']
-        self.b2 = data['b2']
-        self.W3 = data['W3']
-        self.b3 = data['b3']
+        features = self.feature(x)
+        value = self.value_stream(features)
+        advantage = self.advantage_stream(features)
+        return value + (advantage - advantage.mean(dim=1, keepdim=True))
 
 
 # ──────────────────────────────────────────────
-#  Experience Replay Buffer
+#  Prioritized Experience Replay
 # ──────────────────────────────────────────────
 
-class ReplayBuffer:
+class PrioritizedReplayBuffer:
     """
-    Stores past experiences (state, action, reward, next_state, done)
-    and samples random mini-batches for training.
+    Proportional Prioritized Experience Replay (Schaul et al., 2016).
 
-    This breaks correlation between consecutive decisions and
-    prevents catastrophic forgetting.
+    Transitions with larger TD-error are sampled more often, focusing
+    learning on the most informative experiences. Importance-sampling
+    weights correct the resulting bias.
     """
 
-    def __init__(self, capacity=5000):
+    def __init__(self, capacity=8000, alpha=0.6):
         self.capacity = capacity
+        self.alpha = alpha
         self.buffer = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
         self.position = 0
 
     def push(self, state, action, reward, next_state, done):
-        """Store one experience."""
+        """Store one experience with max priority so it gets sampled at least once."""
+        max_priority = self.priorities[:len(self.buffer)].max() if self.buffer else 1.0
         experience = (state, action, reward, next_state, done)
         if len(self.buffer) < self.capacity:
             self.buffer.append(experience)
         else:
             self.buffer[self.position] = experience
+        self.priorities[self.position] = max_priority
         self.position = (self.position + 1) % self.capacity
 
-    def sample(self, batch_size):
-        """Sample a random mini-batch."""
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+    def sample(self, batch_size, beta=0.4):
+        """Sample a prioritized mini-batch and return importance-sampling weights."""
+        if len(self.buffer) == self.capacity:
+            priorities = self.priorities
+        else:
+            priorities = self.priorities[:len(self.buffer)]
+
+        scaled = priorities ** self.alpha
+        probs = scaled / scaled.sum()
+
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False, p=probs)
         batch = [self.buffer[i] for i in indices]
+
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
 
         states = np.array([e[0] for e in batch])
         actions = np.array([e[1] for e in batch])
@@ -168,7 +159,12 @@ class ReplayBuffer:
         next_states = np.array([e[3] for e in batch])
         dones = np.array([e[4] for e in batch])
 
-        return states, actions, rewards, next_states, dones
+        return states, actions, rewards, next_states, dones, indices, weights.astype(np.float32)
+
+    def update_priorities(self, indices, td_errors):
+        """Update priorities for sampled transitions using their fresh TD-errors."""
+        for idx, td_error in zip(indices, td_errors):
+            self.priorities[idx] = abs(float(td_error)) + 1e-5
 
     def __len__(self):
         return len(self.buffer)
@@ -180,21 +176,23 @@ class ReplayBuffer:
 
 class DQNAgent:
     """
-    Deep Q-Network agent for load balancing:
-    - Network: 192 hidden units (increased from 160 for better pattern learning)
-    - Learning Rate: 0.001 (stable, proven convergence)
-    - Batch Size: 48 (balanced gradient stability)
-    - Epsilon Decay: 0.995 (gradual exploration→exploitation)
-    - Replay Buffer: 8,000 (diverse experience sampling)
-    - Target Network: Updated every 10 episodes for stable Q-values
-    - Training: 2000 episodes for thorough convergence
-    - Reward: Pure latency-based (naturally encodes queue via latency calculation)
+    PyTorch Deep Q-Network agent for adaptive load balancing.
+
+    Combines Double DQN + Dueling architecture + Prioritized Experience
+    Replay + soft (Polyak) target updates for stable, sample-efficient
+    learning, trained with AdamW, Huber loss, gradient clipping, LR
+    scheduling, and (on CUDA) automatic mixed precision.
     """
 
-    def __init__(self, state_size=9, action_size=3, hidden_size=192,
+    def __init__(self, state_size=9, action_size=3, hidden_size=128,
                  lr=0.001, gamma=0.99, epsilon_start=1.0, epsilon_end=0.05,
-                 epsilon_decay=0.995, buffer_size=8000, batch_size=48,
-                 target_update_freq=10):
+                 epsilon_decay=0.995, buffer_size=20000, batch_size=64,
+                 target_update_freq=10, tau=0.01, weight_decay=1e-5,
+                 per_alpha=0.6, per_beta_start=0.4, grad_clip_norm=1.0,
+                 lr_step_size=200, lr_gamma=0.9, seed=42,
+                 log_dir=None, use_amp=None):
+
+        seed_everything(seed)
 
         self.state_size = state_size
         self.action_size = action_size
@@ -204,98 +202,183 @@ class DQNAgent:
         self.epsilon_decay = epsilon_decay
         self.batch_size = batch_size
         self.target_update_freq = target_update_freq
+        self.tau = tau
+        self.grad_clip_norm = grad_clip_norm
+        self.per_beta = per_beta_start
 
-        # Q-Network (for decisions)
-        self.q_network = NeuralNetwork(state_size, hidden_size, action_size, lr)
+        self.device = get_device()
 
-        # Target Network (for stable Q-value targets)
-        self.target_network = NeuralNetwork(state_size, hidden_size, action_size, lr)
-        self.target_network.copy_weights_from(self.q_network)
+        # Online (Q) network and target network (Dueling architecture)
+        self.q_network = DuelingQNetwork(state_size, hidden_size, action_size).to(self.device)
+        self.target_network = DuelingQNetwork(state_size, hidden_size, action_size).to(self.device)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        self.target_network.eval()
 
-        # Experience Replay
-        self.memory = ReplayBuffer(buffer_size)
+        # AdamW optimizer + step LR scheduler
+        self.optimizer = torch.optim.AdamW(
+            self.q_network.parameters(), lr=lr, weight_decay=weight_decay
+        )
+        self.scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=lr_step_size, gamma=lr_gamma
+        )
 
-        # Training stats
+        # Huber loss (per-sample, so PER importance weights can be applied)
+        self.loss_fn = nn.SmoothL1Loss(reduction='none')
+
+        # Mixed precision only makes sense on CUDA
+        self.use_amp = use_amp if use_amp is not None else (self.device.type == 'cuda')
+        self.scaler = torch.amp.GradScaler(device=self.device.type, enabled=self.use_amp)
+
+        # Prioritized Experience Replay
+        self.memory = PrioritizedReplayBuffer(buffer_size, alpha=per_alpha)
+
+        # Training stats / bookkeeping
         self.training_losses = []
         self.episode_rewards = []
+        self.train_step_count = 0
+
+        self.writer = SummaryWriter(log_dir) if (log_dir and SummaryWriter is not None) else None
 
     def act(self, state, training=True):
         """
-        Choose action using epsilon-greedy policy.
-        - With probability ε: pick random server (explore)
-        - With probability 1-ε: pick server with highest Q-value (exploit)
+        Choose action using epsilon-greedy policy with sticky exploration.
         """
-        state = np.asarray(state, dtype=np.float32)
-        if training and np.random.random() < self.epsilon:
-            return np.random.randint(0, self.action_size)
+        if not hasattr(self, 'sticky_burst_remaining'):
+            self.sticky_burst_remaining = 0
+            self.sticky_action = 0
 
-        q_values = self.q_network.forward(state)
-        return int(np.argmax(q_values[0]))
+        if training:
+            if self.sticky_burst_remaining > 0:
+                self.sticky_burst_remaining -= 1
+                return self.sticky_action
+
+            if np.random.random() < self.epsilon:
+                self.sticky_action = np.random.randint(0, self.action_size)
+                self.sticky_burst_remaining = np.random.randint(5, 16) - 1
+                return self.sticky_action
+
+        state_t = torch.as_tensor(np.asarray(state, dtype=np.float32), device=self.device).unsqueeze(0)
+        self.q_network.eval()
+        with torch.no_grad():
+            q_values = self.q_network(state_t)
+        self.q_network.train()
+        return int(torch.argmax(q_values, dim=1).item())
 
     def predict(self, state, deterministic=True):
-        """Predict action (compatible interface for evaluation)."""
-        state = np.asarray(state, dtype=np.float32)
+        """Predict action (compatible interface for evaluation/baselines code)."""
         if deterministic:
-            q_values = self.q_network.forward(state)
-            action = int(np.argmax(q_values[0]))
+            state_t = torch.as_tensor(np.asarray(state, dtype=np.float32), device=self.device).unsqueeze(0)
+            self.q_network.eval()
+            with torch.no_grad():
+                q_values = self.q_network(state_t)
+            action = int(torch.argmax(q_values, dim=1).item())
         else:
             action = self.act(state, training=True)
         return action, None
 
     def remember(self, state, action, reward, next_state, done):
-        """Store experience in replay buffer."""
+        """Store experience in prioritized replay buffer."""
         self.memory.push(state, action, reward, next_state, done)
 
     def train_step(self):
         """
-        Sample mini-batch from replay buffer and update Q-network.
-        Uses the Bellman equation:
-            Q_target = reward + γ * max(Q_target_network(next_state))
+        Sample a prioritized mini-batch and update the online Q-network.
+
+        Double DQN target:
+            a* = argmax_a Q_online(s', a)
+            y  = r + gamma * Q_target(s', a*)
         """
         if len(self.memory) < self.batch_size:
             return 0.0
 
-        # Sample random mini-batch
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
+        states, actions, rewards, next_states, dones, indices, is_weights = self.memory.sample(
+            self.batch_size, beta=self.per_beta
+        )
 
-        # Current Q-values from the online network
-        current_q = self.q_network.forward(states)
+        states_t = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        actions_t = torch.as_tensor(actions, dtype=torch.long, device=self.device)
+        rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
+        next_states_t = torch.as_tensor(next_states, dtype=torch.float32, device=self.device)
+        dones_t = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
+        weights_t = torch.as_tensor(is_weights, dtype=torch.float32, device=self.device)
 
-        # Use the online network to choose the next action and the target network to estimate its value.
-        next_online_q = self.q_network.forward(next_states)
-        next_actions = np.argmax(next_online_q, axis=1)
-        next_target_q = self.target_network.forward(next_states)
+        with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+            current_q = self.q_network(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
 
-        # Compute target Q-values using Bellman equation
-        target_q = current_q.copy()
-        for i in range(self.batch_size):
-            if dones[i]:
-                target_q[i, actions[i]] = rewards[i]
-            else:
-                target_q[i, actions[i]] = rewards[i] + self.gamma * next_target_q[i, next_actions[i]]
+            with torch.no_grad():
+                # Double DQN: online network selects the action, target network evaluates it
+                next_online_q = self.q_network(next_states_t)
+                next_actions = torch.argmax(next_online_q, dim=1)
+                next_target_q = self.target_network(next_states_t).gather(
+                    1, next_actions.unsqueeze(1)
+                ).squeeze(1)
+                target_q = rewards_t + (1.0 - dones_t) * self.gamma * next_target_q
+                # Clip targets to a stable range for learning
+                target_q = torch.clamp(target_q, -2.0, 0.0)
 
-        # Clip targets to a stable range for learning
-        target_q = np.clip(target_q, -2.0, 0.0)
+            elementwise_loss = self.loss_fn(current_q, target_q)
+            loss = (elementwise_loss * weights_t).mean()
 
-        # Update Q-network via backpropagation
-        loss = self.q_network.backward(states, target_q)
-        self.training_losses.append(float(loss))
+        td_errors = (current_q - target_q).detach()
 
-        return loss
+        self.optimizer.zero_grad(set_to_none=True)
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), self.grad_clip_norm)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        # Refresh priorities based on the fresh TD-errors
+        self.memory.update_priorities(indices, td_errors.cpu().numpy())
+
+        self.train_step_count += 1
+        loss_value = float(loss.item())
+        self.training_losses.append(loss_value)
+
+        if self.writer is not None:
+            self.writer.add_scalar('train/loss', loss_value, self.train_step_count)
+            self.writer.add_scalar('train/epsilon', self.epsilon, self.train_step_count)
+            self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.train_step_count)
+
+        # Soft-update target network every step for smoother convergence
+        self._soft_update_target()
+
+        return loss_value
+
+    def _soft_update_target(self):
+        """Polyak averaging: target = tau * online + (1 - tau) * target."""
+        with torch.no_grad():
+            for target_param, online_param in zip(
+                self.target_network.parameters(), self.q_network.parameters()
+            ):
+                target_param.data.mul_(1.0 - self.tau)
+                target_param.data.add_(self.tau * online_param.data)
 
     def update_epsilon(self):
         """Decay exploration rate."""
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
 
+    def update_per_beta(self, episode, total_episodes, beta_end=1.0):
+        """Anneal PER importance-sampling beta towards 1.0 over training."""
+        progress = min(episode / max(total_episodes, 1), 1.0)
+        self.per_beta = self.per_beta + progress * (beta_end - self.per_beta)
+
     def update_target_network(self):
-        """Copy Q-network weights to target network."""
-        self.target_network.copy_weights_from(self.q_network)
+        """Hard sync of target network (kept for periodic full-copy compatibility)."""
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+    def step_scheduler(self):
+        """Advance the learning-rate scheduler by one step."""
+        self.scheduler.step()
 
     def save(self, path="models/dqn_agent"):
-        """Save model weights and config."""
+        """Save model weights, optimizer state, and config as a checkpoint."""
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-        self.q_network.save(path + "_q")
-        self.target_network.save(path + "_target")
+        torch.save({
+            'q_network': self.q_network.state_dict(),
+            'target_network': self.target_network.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+        }, path + ".pt")
 
         config = {
             'state_size': int(self.state_size),
@@ -307,11 +390,18 @@ class DQNAgent:
             json.dump(config, f)
 
     def load(self, path="models/dqn_agent"):
-        """Load model weights."""
-        self.q_network.load(path + "_q")
-        self.target_network.load(path + "_target")
+        """Load model weights (and optimizer state, if present) from a checkpoint."""
+        checkpoint_path = path if path.endswith(".pt") else path + ".pt"
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.q_network.load_state_dict(checkpoint['q_network'])
+        self.target_network.load_state_dict(checkpoint['target_network'])
+        if 'optimizer' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer'])
+            except ValueError:
+                pass  # optimizer shape mismatch (e.g. different hidden size) — skip
 
-        config_path = path + "_config.json"
+        config_path = (path[:-3] if path.endswith(".pt") else path) + "_config.json"
         if os.path.exists(config_path):
             with open(config_path) as f:
                 config = json.load(f)
@@ -323,9 +413,13 @@ class DQNAgent:
 # ──────────────────────────────────────────────
 
 def train_rl_agent(env, n_episodes=20, max_steps=200, model_path="models/dqn_agent",
-                   progress_callback=None, **kwargs):
+                    progress_callback=None, patience=40, log_dir="logs", **kwargs):
     """
     Train the DQN agent on the load balancing environment.
+
+    Includes checkpointing (best model by episode reward is saved as we go)
+    and early stopping (training halts once `patience` episodes pass without
+    improvement).
 
     Args:
         env: LoadBalancerEnv instance
@@ -333,6 +427,8 @@ def train_rl_agent(env, n_episodes=20, max_steps=200, model_path="models/dqn_age
         max_steps: Steps per episode
         model_path: Where to save the trained model
         progress_callback: Optional function(episode, n_episodes, avg_reward) for progress updates
+        patience: Episodes without improvement before early stopping
+        log_dir: TensorBoard log directory (None disables logging)
 
     Returns:
         agent: Trained DQNAgent
@@ -354,14 +450,26 @@ def train_rl_agent(env, n_episodes=20, max_steps=200, model_path="models/dqn_age
         buffer_size=kwargs.get('buffer_size', 8000),
         batch_size=kwargs.get('batch_size', 48),
         target_update_freq=kwargs.get('target_update_freq', 10),
+        tau=kwargs.get('tau', 0.01),
+        weight_decay=kwargs.get('weight_decay', 1e-5),
+        per_alpha=kwargs.get('per_alpha', 0.6),
+        per_beta_start=kwargs.get('per_beta_start', 0.4),
+        grad_clip_norm=kwargs.get('grad_clip_norm', 1.0),
+        lr_step_size=kwargs.get('lr_step_size', 200),
+        lr_gamma=kwargs.get('lr_gamma', 0.9),
+        seed=kwargs.get('seed', 42),
+        log_dir=log_dir,
     )
 
     episode_rewards = []
     episode_latencies = []
+    best_latency = float('inf')
+    episodes_without_improvement = 0
 
+    print(f"Training on device: {agent.device}")
     print(f"Starting DQN training for {n_episodes} episodes...")
-    print(f"Network: {state_size} → {kwargs.get('hidden_size', 192)} → {kwargs.get('hidden_size', 192)} → {action_size}")
-    print(f"Replay buffer: {agent.memory.capacity}, Batch: {agent.batch_size}")
+    print(f"Network: {state_size} -> {kwargs.get('hidden_size', 192)} (dueling) -> {action_size}")
+    print(f"Replay buffer: {agent.memory.capacity} (prioritized), Batch: {agent.batch_size}")
     print()
 
     for episode in range(n_episodes):
@@ -380,7 +488,7 @@ def train_rl_agent(env, n_episodes=20, max_steps=200, model_path="models/dqn_age
             done = terminated or truncated
             agent.remember(state, action, reward, next_state, done)
 
-            # Train on mini-batch from replay buffer
+            # Train on a prioritized mini-batch from replay buffer
             agent.train_step()
 
             total_reward += reward
@@ -396,26 +504,56 @@ def train_rl_agent(env, n_episodes=20, max_steps=200, model_path="models/dqn_age
         avg_latency = np.mean(ep_latencies)
         episode_latencies.append(avg_latency)
 
-        # Decay epsilon
+        # Decay epsilon, anneal PER beta, step LR scheduler
         agent.update_epsilon()
+        agent.update_per_beta(episode, n_episodes)
+        agent.step_scheduler()
 
-        # Update target network periodically
+        # Periodic hard sync on top of the continuous soft updates
         if (episode + 1) % agent.target_update_freq == 0:
             agent.update_target_network()
-            print(f"  → Target network updated at episode {episode + 1}")
+
+        if agent.writer is not None:
+            agent.writer.add_scalar('episode/reward', total_reward, episode + 1)
+            agent.writer.add_scalar('episode/avg_latency', avg_latency, episode + 1)
 
         # Progress reporting
         print(f"Episode {episode + 1}/{n_episodes} | "
               f"Reward: {total_reward:.1f} | "
               f"Avg Latency: {avg_latency:.1f} ms | "
-              f"Epsilon: {agent.epsilon:.3f}")
+              f"Epsilon: {agent.epsilon:.3f} | "
+              f"LR: {agent.optimizer.param_groups[0]['lr']:.6f}")
 
         if progress_callback:
             progress_callback(episode + 1, n_episodes, total_reward)
 
-    # Save trained model
-    agent.save(model_path)
-    print(f"\nModel saved to {model_path}")
+        # Periodic deterministic evaluation for checkpointing and early stopping
+        if (episode + 1) % 10 == 0:
+            eval_results = evaluate_rl_agent(env, agent, n_episodes=3, max_steps=max_steps)
+            eval_latency = eval_results['avg_latency']
+            
+            print(f"  --> Evaluation Latency: {eval_latency:.2f} ms")
+            
+            # Improvement of more than 0.5 ms?
+            if eval_latency < best_latency - 0.5:
+                best_latency = eval_latency
+                episodes_without_improvement = 0
+                agent.save(model_path)
+                print(f"  --> New best model saved (Latency: {best_latency:.2f} ms)")
+            else:
+                episodes_without_improvement += 10  # we evaluate every 10 episodes
+                
+            if episodes_without_improvement >= patience:
+                print(f"\nEarly stopping at episode {episode + 1} "
+                      f"(no improvement for {patience} episodes)")
+                # Reload the best checkpoint found as per paper
+                agent.load(model_path)
+                break
+
+    if agent.writer is not None:
+        agent.writer.close()
+
+    print(f"\nBest model saved to {model_path}.pt (reward={best_reward:.1f})")
     print(f"Final epsilon: {agent.epsilon:.4f}")
 
     return agent, episode_rewards, episode_latencies
@@ -427,13 +565,16 @@ def evaluate_rl_agent(env, agent, n_episodes=10, max_steps=200):
 
     Returns dict with:
         avg_reward, avg_latency, avg_utilization, fairness_index,
-        std_latency, std_utilization, per_server_utilization
+        std_latency, std_utilization, per_server_utilization, p99_latency
     """
+    features_per_server = getattr(env, 'FEATURES_PER_SERVER', 3)
+
     total_rewards = []
     latencies = []
     utilizations = []
     fairness_scores = []
     all_per_server = []
+    all_latencies_flat = []
 
     for episode in range(n_episodes):
         state, _ = env.reset()
@@ -449,9 +590,10 @@ def evaluate_rl_agent(env, agent, n_episodes=10, max_steps=200):
 
             episode_reward += reward
             episode_latencies.append(-reward)
+            all_latencies_flat.append(-reward)
 
             # Track per-server CPU utilizations
-            server_cpus = [next_state[i * 3] for i in range(env.n_servers)]
+            server_cpus = [next_state[i * features_per_server] for i in range(env.n_servers)]
             episode_utilizations.append(np.mean(server_cpus))
             episode_per_server.append(server_cpus)
 
@@ -464,7 +606,7 @@ def evaluate_rl_agent(env, agent, n_episodes=10, max_steps=200):
         utilizations.append(np.mean(episode_utilizations))
 
         # Jain's Fairness Index on final server utilizations
-        final_utils = [state[i * 3] for i in range(env.n_servers)]
+        final_utils = [state[i * features_per_server] for i in range(env.n_servers)]
         if sum(final_utils) > 0:
             fairness = sum(final_utils) ** 2 / (len(final_utils) * sum(u ** 2 for u in final_utils))
         else:
@@ -483,7 +625,7 @@ def evaluate_rl_agent(env, agent, n_episodes=10, max_steps=200):
         'std_latency': float(np.std(latencies)),
         'std_utilization': float(np.std(utilizations)),
         'per_server_utilization': np.mean(all_per_server, axis=0).tolist(),
-        'p99_latency': float(np.percentile([l for ep in latencies for l in [ep]], 99)),
+        'p99_latency': float(np.percentile(all_latencies_flat, 99)) if all_latencies_flat else 0.0,
     }
 
 
@@ -491,5 +633,5 @@ def load_rl_agent(model_path="models/dqn_agent", state_size=9, action_size=3):
     """Load a trained DQN agent from disk."""
     agent = DQNAgent(state_size=state_size, action_size=action_size)
     agent.load(model_path)
-    print(f"DQN agent loaded from {model_path}")
+    print(f"DQN agent loaded from {model_path} (device: {agent.device})")
     return agent

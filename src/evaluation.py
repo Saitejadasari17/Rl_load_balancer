@@ -143,7 +143,8 @@ def generate_summary_report(results, save_path="results/summary_report.txt"):
     with open(save_path, 'w') as f:
         f.write("ADAPTIVE LOAD BALANCING EVALUATION REPORT\n")
         f.write("=" * 50 + "\n")
-        f.write("Agent: Deep Q-Network (DQN) — NumPy implementation\n\n")
+        f.write("Agent: Deep Q-Network (DQN) — PyTorch implementation\n")
+        f.write("        (Double DQN + Dueling architecture + Prioritized Experience Replay)\n\n")
 
         f.write("ALGORITHMS COMPARED:\n")
         for alg in results.keys():

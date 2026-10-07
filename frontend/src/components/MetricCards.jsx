@@ -18,7 +18,7 @@ export default function MetricCards({ results }) {
       <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
         <div className="text-sm text-slate-400 mb-1">RL Agent</div>
         <div className="text-2xl font-bold text-blue-400">{results.rl_agent_ms.toFixed(2)} ms</div>
-        <div className="text-xs text-slate-500 mt-2">PPO Algorithm</div>
+        <div className="text-xs text-slate-500 mt-2">Dueling Double DQN</div>
       </div>
 
       {/* Improvement */}
