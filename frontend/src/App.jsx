@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { Activity, TrendingDown, BarChart3, Zap } from 'lucide-react';
 import UploadSection from './components/UploadSection';
 import TrainingProgress from './components/TrainingProgress';
@@ -9,44 +9,20 @@ export default function App() {
   const [apiUrl] = useState(import.meta.env.VITE_API_URL || 'http://localhost:8000');
   const [trainingStatus, setTrainingStatus] = useState('idle');
   const [results, setResults] = useState(null);
+  const [error, setError] = useState(null);
   const [trainConfig, setTrainConfig] = useState({
     timesteps: 50000,
-    episodes: 10,
+    episodes: 100,
     servers: 3
   });
 
-  // Poll training status
-  useEffect(() => {
-    if (trainingStatus !== 'idle' && trainingStatus !== 'completed') {
-      const interval = setInterval(async () => {
-        try {
-          const res = await fetch(`${apiUrl}/training-status`);
-          const data = await res.json();
-
-          if (data.status === 'completed') {
-            setTrainingStatus('completed');
-            fetchResults();
-          }
-        } catch (err) {
-          console.error('Status fetch error:', err);
-        }
-      }, 1000);
-      return () => clearInterval(interval);
-    }
-  }, [trainingStatus, apiUrl]);
-
-  const fetchResults = async () => {
-    try {
-      const res = await fetch(`${apiUrl}/results`);
-      const data = await res.json();
-      setResults(data);
-    } catch (err) {
-      console.error('Results fetch error:', err);
-    }
-  };
-
+  // /train is synchronous — it blocks until training is done and returns results inline.
+  // No polling needed; we just await the response.
   const handleStartTraining = async () => {
     setTrainingStatus('training');
+    setResults(null);
+    setError(null);
+
     try {
       const res = await fetch(`${apiUrl}/train`, {
         method: 'POST',
@@ -54,13 +30,17 @@ export default function App() {
         body: JSON.stringify(trainConfig)
       });
 
-      if (!res.ok) throw new Error('Training failed');
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.detail || `HTTP ${res.status}`);
+      }
 
       const data = await res.json();
       setResults(data);
       setTrainingStatus('completed');
     } catch (err) {
       console.error('Training error:', err);
+      setError(err.message);
       setTrainingStatus('idle');
     }
   };
@@ -74,7 +54,7 @@ export default function App() {
             <Zap className="w-8 h-8 text-blue-500" />
             <h1 className="text-3xl font-bold">RL Load Balancer</h1>
           </div>
-          <p className="text-slate-400">Adaptive load balancing using reinforcement learning </p>
+          <p className="text-slate-400">Adaptive load balancing using Deep Reinforcement Learning</p>
         </div>
       </header>
 
@@ -93,36 +73,65 @@ export default function App() {
             </h3>
             <div className="space-y-4">
               <div>
-                <label className="text-sm text-slate-400">Timesteps</label>
+                <label className="text-sm text-slate-400">Training Episodes</label>
                 <input
                   type="number"
-                  value={trainConfig.timesteps}
-                  onChange={e => setTrainConfig({ ...trainConfig, timesteps: parseInt(e.target.value) })}
+                  min={10}
+                  max={2000}
+                  value={trainConfig.episodes}
+                  onChange={e => setTrainConfig({ ...trainConfig, episodes: parseInt(e.target.value) || 100 })}
                   className="w-full mt-1 bg-slate-700 border border-slate-600 rounded px-3 py-2 text-white"
                 />
+                <p className="text-xs text-slate-500 mt-1">Recommended: 200+ for meaningful learning</p>
               </div>
               <div>
-                <label className="text-sm text-slate-400">Episodes</label>
+                <label className="text-sm text-slate-400">Servers</label>
                 <input
                   type="number"
-                  value={trainConfig.episodes}
-                  onChange={e => setTrainConfig({ ...trainConfig, episodes: parseInt(e.target.value) })}
+                  min={2}
+                  max={10}
+                  value={trainConfig.servers}
+                  onChange={e => setTrainConfig({ ...trainConfig, servers: parseInt(e.target.value) || 3 })}
                   className="w-full mt-1 bg-slate-700 border border-slate-600 rounded px-3 py-2 text-white"
                 />
               </div>
               <button
                 onClick={handleStartTraining}
                 disabled={trainingStatus === 'training'}
-                className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 px-4 py-2 rounded font-semibold transition"
+                className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-600 disabled:cursor-not-allowed px-4 py-2 rounded font-semibold transition"
               >
-                {trainingStatus === 'training' ? 'Training...' : 'Start Training'}
+                {trainingStatus === 'training' ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                    </svg>
+                    Training... (check terminal)
+                  </span>
+                ) : 'Start Training'}
               </button>
+
+              {trainingStatus === 'completed' && (
+                <button
+                  onClick={() => { setResults(null); setTrainingStatus('idle'); }}
+                  className="w-full bg-slate-700 hover:bg-slate-600 px-4 py-2 rounded font-semibold transition text-sm"
+                >
+                  Reset & Train Again
+                </button>
+              )}
             </div>
           </div>
         </section>
 
-        {/* Training Progress */}
-        {trainingStatus !== 'idle' && (
+        {/* Error banner */}
+        {error && (
+          <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300">
+            <strong>Training failed:</strong> {error}
+          </div>
+        )}
+
+        {/* Training in-progress notice */}
+        {trainingStatus === 'training' && (
           <TrainingProgress status={trainingStatus} />
         )}
 
@@ -139,7 +148,8 @@ export default function App() {
           <div className="text-center py-12 bg-slate-800/30 rounded-lg border border-slate-700">
             <BarChart3 className="w-12 h-12 text-slate-600 mx-auto mb-4" />
             <h3 className="text-xl font-semibold text-slate-400 mb-2">Ready to train</h3>
-            <p className="text-slate-500">Upload a dataset and start training your RL agent</p>
+            <p className="text-slate-500">Configure episodes above and click Start Training</p>
+            <p className="text-slate-600 text-sm mt-2">For demo purposes use 50 episodes (~30 seconds). For real results use 500+.</p>
           </div>
         )}
       </main>
