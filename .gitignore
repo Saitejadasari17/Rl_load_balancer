@@ -1,7 +1,50 @@
-data/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv
+env/
+venv/
+
+# Models & Results (generated at runtime)
 models/
+results/
+logs/
+backend/logs/
+
+# Data (large files)
+data/
+
+# Node
 node_modules/
 frontend/node_modules/
-dist/
 frontend/dist/
+
+# Deployment
 .vercel/
+.render/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+tests/__pycache__/
